@@ -1,0 +1,21 @@
+timezones_list = [
+    "UTC",
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+    "America/Montreal",
+    "Europe/London",
+    "Europe/Paris",
+    "Europe/Berlin",
+    "Europe/Moscow",
+    "Asia/Tokyo",
+    "Asia/Shanghai",
+    "Asia/Kolkata",
+    "Asia/Dubai",
+    "Asia/Dhaka", 
+    "Australia/Sydney",
+    "Australia/Perth",
+    "Africa/Johannesburg",
+    "Pacific/Auckland"
+]
