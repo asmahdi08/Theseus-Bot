@@ -13,10 +13,7 @@ from utils import utils
 logger = logging.getLogger(__name__)
 
 dotenv.load_dotenv(dotenv.find_dotenv())
-MONGO_PASS = os.getenv("MONGO_PASS")
-MONGO_USR = os.getenv("MONGO_USR")
-
-CONN_STR = f"mongodb+srv://{quote_plus(MONGO_USR)}:{quote_plus(MONGO_PASS)}@botcluster.6z4atou.mongodb.net/?retryWrites=true&w=majority&appName=botcluster"
+CONN_STR = os.getenv("MONGO_CONN_STR")
 
 client = MongoClient(CONN_STR)
 
