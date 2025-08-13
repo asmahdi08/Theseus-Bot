@@ -5,8 +5,12 @@ import pprint
 from bson.objectid import ObjectId
 import os
 import time
+import logging
 from datetime import datetime
 from utils import utils
+
+# Configure logger
+logger = logging.getLogger(__name__)
 
 dotenv.load_dotenv(dotenv.find_dotenv())
 MONGO_PASS = os.getenv("MONGO_PASS")
@@ -35,11 +39,14 @@ def create_rem_doc(userId, title, desc, date, time, jobId):
     }
     
     reminder_collection.insert_one(doc)
-    print("successfully inserted reminder doc")
+    logger.debug(f"Created reminder document for job {jobId}")
     
 def remove_rem_doc(jobId):
-    reminder_collection.delete_one({"job_id": jobId})
-    print("removed doc")
+    result = reminder_collection.delete_one({"job_id": jobId})
+    if result.deleted_count > 0:
+        logger.debug(f"Removed reminder document for job {jobId}")
+    else:
+        logger.warning(f"No reminder document found for job {jobId}")
 
 def list_user_reminders(userId):
     return list(reminder_collection.find({"userId": userId}))
@@ -71,10 +78,10 @@ def create_tz_doc(userId, timezone):
     }
     if not timezones_collection.find_one({"userId":userId}):
         timezones_collection.insert_one(doc)
-        print("successfully inserted timezone doc")
+        logger.debug(f"Created timezone document for user {userId}")
     else:
         timezones_collection.update_one({"userId":userId},{"$set":{"timezone":timezone}})
-        print("successfully updated timezone doc")
+        logger.debug(f"Updated timezone document for user {userId}")
         
 def get_user_tz(userId) -> str:
     data = timezones_collection.find_one({"userId":userId})
@@ -104,7 +111,7 @@ def ensure_indexes():
             ("userId", 1)
         ], name="userId_tz_unique", unique=True)
     except Exception as e:
-        print(f"Index creation warning: {e}")
+        logger.warning(f"Index creation warning: {e}")
         
 def rem_poll_doc(poll_id):
     try:
@@ -112,19 +119,19 @@ def rem_poll_doc(poll_id):
         try:
             result = polls_collection.delete_one({"_id": ObjectId(poll_id)})
             if result.deleted_count > 0:
-                print(f"Successfully deleted poll by ObjectId {poll_id}")
+                logger.debug(f"Deleted poll by ObjectId {poll_id}")
                 return True
         except:
             # If ObjectId fails, try by message ID
             result = polls_collection.delete_one({"poll_msg_id": poll_id})
             if result.deleted_count > 0:
-                print(f"Successfully deleted poll by message ID {poll_id}")
+                logger.debug(f"Deleted poll by message ID {poll_id}")
                 return True
         
-        print(f"No poll found with ID {poll_id}")
+        logger.warning(f"No poll found with ID {poll_id}")
         return False
     except Exception as e:
-        print(f"Error deleting poll {poll_id}: {e}")
+        logger.error(f"Error deleting poll {poll_id}: {e}")
         return False
 
 def get_poll_by_id(poll_id):
@@ -174,8 +181,11 @@ def get_reply(command_name):
     return msg
 
 def rem_custom_command(command_name):
-    commands_collection.delete_one({"command_name":command_name})
-    print("removed command: ",command_name)
+    result = commands_collection.delete_one({"command_name":command_name})
+    if result.deleted_count > 0:
+        logger.debug(f"Removed custom command: {command_name}")
+    else:
+        logger.warning(f"No custom command found with name: {command_name}")
     
 def get_all_commands():
     commands = commands_collection.find()
