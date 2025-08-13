@@ -17,6 +17,7 @@ dotenv.load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
+CUSTOM_COMMAND_PREFIX = "!"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -46,6 +47,7 @@ async def on_ready():
             job_defaults={'coalesce': True, 'max_instances': 1}
         )
         bot.scheduler.start()
+        await handle_missed_reminders()
         # Register a listener once to clean up reminder docs when jobs finish
         def _on_job_done(event):
             try:
@@ -167,7 +169,7 @@ async def execute_task(userId, title, desc):
     embed = discord.Embed(
         title="Reminder",
         description=f"""
-            # {title}
+            # :clock2: {title}
             \n
             ### Reminder Description:\n
             {desc}
@@ -207,299 +209,363 @@ async def cancelreminder(interaction: discord.Interaction, job_id: str):
         return
     try:
         bot.scheduler.remove_job(job_id)
-        # Remove from DB as well
         db.remove_rem_doc(job_id)
         await interaction.response.send_message(f"Cancelled reminder with Job ID `{job_id}`.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"Failed to cancel: {e}", ephemeral=True)
 
+# Poll system
 @bot.tree.command(name="createpoll", description="Create a poll with multiple options", guild=discord.Object(GUILD_ID))
 @app_commands.describe(
     question="The poll question",
-    option1="First option",
-    option2="Second option", 
-    option3="Third option (optional)",
-    option4="Fourth option (optional)",
-    option5="Fifth option (optional)"
+    options="Poll options separated by commas (e.g., Option1, Option2, Option3)"
 )
-async def createpoll(interaction: discord.Interaction, question: str, option1: str, option2: str, 
-                    option3: str = None, option4: str = None, option5: str = None):
-    
-    # Collect non-empty options
-    options = [option1, option2]
-    if option3: options.append(option3)
-    if option4: options.append(option4) 
-    if option5: options.append(option5)
-    
-    if len(options) < 2:
-        await interaction.response.send_message("You need at least 2 options for a poll!", ephemeral=True)
-        return
-        
-    # Create poll embed
-    embed = discord.Embed(
-        title="📊 " + question,
-        description="React to vote!",
-        color=discord.Color.blue()
-    )
-    
-    # Number emojis for voting
-    number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
-    
-    # Add options to embed
-    poll_text = ""
-    for i, option in enumerate(options):
-        poll_text += f"{number_emojis[i]} {option}\n"
-        
-    embed.add_field(name="Options:", value=poll_text, inline=False)
-    embed.add_field(name="Votes:", value="No votes yet", inline=False)
-    embed.set_footer(text=f"Poll created by {interaction.user.display_name}")
-    
-    # Send the poll
-    await interaction.response.send_message(embed=embed)
-    message = await interaction.original_response()
-    
-    # Add reaction buttons
-    for i in range(len(options)):
-        await message.add_reaction(number_emojis[i])
-    
-    # Store poll in database
-    poll_data = {
-        "message_id": message.id,
-        "channel_id": interaction.channel.id,
-        "creator_id": interaction.user.id,
-        "question": question,
-        "options": options,
-        "votes": {str(i): [] for i in range(len(options))},  # Track user IDs per option
-        "created_at": datetime.now(pytz.utc).isoformat()
-    }
-    
-    db.polls_collection.insert_one(poll_data)
-    print(f"Poll created: {question}")
-
-@bot.event
-async def on_reaction_add(reaction, user):
-    # Ignore bot reactions
-    if user.bot:
-        return
-        
-    # Check if reaction is on a poll
-    poll = db.polls_collection.find_one({"message_id": reaction.message.id})
-    if not poll:
-        return
-        
-    # Check if it's a valid poll emoji
-    number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
-    if str(reaction.emoji) not in number_emojis[:len(poll["options"])]:
-        return
-        
-    option_index = str(number_emojis.index(str(reaction.emoji)))
-    
-    # Remove user from all other options (single vote per user)
-    for i in range(len(poll["options"])):
-        if str(i) != option_index and user.id in poll["votes"].get(str(i), []):
-            db.polls_collection.update_one(
-                {"message_id": reaction.message.id},
-                {"$pull": {f"votes.{i}": user.id}}
-            )
-            # Remove their reactions from other options
-            for other_reaction in reaction.message.reactions:
-                if str(other_reaction.emoji) == number_emojis[i] and other_reaction.emoji != reaction.emoji:
-                    await other_reaction.remove(user)
-    
-    # Add user to voted option (if not already there)
-    if user.id not in poll["votes"].get(option_index, []):
-        db.polls_collection.update_one(
-            {"message_id": reaction.message.id},
-            {"$addToSet": {f"votes.{option_index}": user.id}}
-        )
-    
-    # Update the embed with vote counts
-    await update_poll_embed(reaction.message)
-
-@bot.event 
-async def on_reaction_remove(reaction, user):
-    # Ignore bot reactions
-    if user.bot:
-        return
-        
-    # Check if reaction is on a poll
-    poll = db.polls_collection.find_one({"message_id": reaction.message.id})
-    if not poll:
-        return
-        
-    # Check if it's a valid poll emoji
-    number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
-    if str(reaction.emoji) not in number_emojis[:len(poll["options"])]:
-        return
-        
-    option_index = str(number_emojis.index(str(reaction.emoji)))
-    
-    # Remove user from this option
-    db.polls_collection.update_one(
-        {"message_id": reaction.message.id},
-        {"$pull": {f"votes.{option_index}": user.id}}
-    )
-    
-    # Update the embed with vote counts
-    await update_poll_embed(reaction.message)
-
-async def update_poll_embed(message):
-    """Update poll embed with current vote counts"""
-    poll = db.polls_collection.find_one({"message_id": message.id})
-    if not poll:
-        return
-        
-    # Create updated embed
-    embed = discord.Embed(
-        title="📊 " + poll["question"],
-        description="React to vote!",
-        color=discord.Color.blue()
-    )
-    
-    number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
-    
-    # Add options to embed
-    poll_text = ""
-    votes_text = ""
-    total_votes = 0
-    
-    for i, option in enumerate(poll["options"]):
-        vote_count = len(poll["votes"].get(str(i), []))
-        total_votes += vote_count
-        poll_text += f"{number_emojis[i]} {option}\n"
-        
-    # Create vote count display with bars
-    if total_votes > 0:
-        for i, option in enumerate(poll["options"]):
-            vote_count = len(poll["votes"].get(str(i), []))
-            percentage = (vote_count / total_votes) * 100 if total_votes > 0 else 0
-            
-            # Create visual bar (max 10 chars)
-            bar_length = int(percentage / 10)
-            bar = "█" * bar_length + "░" * (10 - bar_length)
-            votes_text += f"{number_emojis[i]} **{vote_count}** votes ({percentage:.1f}%)\n`{bar}`\n"
-    else:
-        votes_text = "No votes yet"
-        
-    embed.add_field(name="Options:", value=poll_text, inline=False)
-    embed.add_field(name=f"Votes ({total_votes} total):", value=votes_text, inline=False)
-    
-    creator = await bot.fetch_user(poll["creator_id"])
-    embed.set_footer(text=f"Poll created by {creator.display_name if creator else 'Unknown'}")
-    
+async def createpoll(interaction: discord.Interaction, question: str, options: str):
     try:
-        await message.edit(embed=embed)
-    except Exception as e:
-        print(f"Failed to update poll embed: {e}")
-
-@bot.tree.command(name="endpoll", description="End a poll and show final results", guild=discord.Object(GUILD_ID))
-@app_commands.describe(message_id="The message ID of the poll to end")
-async def endpoll(interaction: discord.Interaction, message_id: str):
-    try:
-        msg_id = int(message_id)
-    except ValueError:
-        await interaction.response.send_message("Invalid message ID!", ephemeral=True)
-        return
+        # Parse options
+        option_list = [opt.strip() for opt in options.split(',') if opt.strip()]
         
-    poll = db.polls_collection.find_one({"message_id": msg_id})
-    if not poll:
-        await interaction.response.send_message("Poll not found!", ephemeral=True)
-        return
+        if len(option_list) < 2:
+            await interaction.response.send_message("Please provide at least 2 options separated by commas.", ephemeral=True)
+            return
         
-    # Check if user is poll creator or has manage messages permission
-    if (poll["creator_id"] != interaction.user.id and 
-        not interaction.user.guild_permissions.manage_messages):
-        await interaction.response.send_message("You can only end polls you created!", ephemeral=True)
-        return
+        if len(option_list) > 10:
+            await interaction.response.send_message("Maximum 10 options allowed.", ephemeral=True)
+            return
         
-    # Get the poll message and clear reactions
-    try:
-        channel = bot.get_channel(poll["channel_id"])
-        message = await channel.fetch_message(msg_id)
-        await message.clear_reactions()
-        
-        # Update embed to show final results
+        # Create poll embed
         embed = discord.Embed(
-            title="📊 " + poll["question"] + " (ENDED)",
-            description="Final Results:",
-            color=discord.Color.red()
+            title=f"📊 {question}",
+            description="Click the buttons below to vote!",
+            color=discord.Color.blue()
         )
         
-        number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+        # Add options to embed
+        for i, option in enumerate(option_list):
+            embed.add_field(
+                name=f"{i+1}️⃣ {option}",
+                value="0 votes",
+                inline=False
+            )
         
-        # Calculate final results
-        total_votes = sum(len(poll["votes"].get(str(i), [])) for i in range(len(poll["options"])))
+        embed.set_footer(text=f"Poll created using Theseus Bot")
         
-        results_text = ""
-        if total_votes > 0:
-            # Sort options by vote count
-            sorted_options = []
-            for i, option in enumerate(poll["options"]):
-                vote_count = len(poll["votes"].get(str(i), []))
-                sorted_options.append((vote_count, i, option))
-            sorted_options.sort(reverse=True)
+        # Create buttons for voting
+        view = PollView(option_list, question, interaction.user.id)
+        
+        await interaction.response.send_message(embed=embed, view=view)
+        
+        # Get the message ID after sending
+        poll_msg = await interaction.original_response()
+        poll_msg_id = poll_msg.id
+        
+        # Store poll in database
+        poll_data = {
+            "question": question,
+            "options": option_list,
+            "votes": {str(i): [] for i in range(len(option_list))},  # Store user IDs who voted for each option
+            "poll_msg_id": str(poll_msg_id),
+            "creator_id": interaction.user.id,
+            "channel_id": interaction.channel.id,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        result = db.polls_collection.insert_one(poll_data)
+        view.poll_id = str(result.inserted_id)
+        
+    except Exception as e:
+        await interaction.response.send_message(f"Error creating poll: {e}", ephemeral=True)
+
+class PollView(discord.ui.View):
+    def __init__(self, options, question, creator_id):
+        super().__init__(timeout=None)  # No timeout for polls
+        self.options = options
+        self.question = question
+        self.creator_id = creator_id
+        self.poll_id = None
+        
+        # Create buttons for each option (max 10)
+        for i, option in enumerate(options[:10]):
+            button = PollButton(label=f"{i+1}. {option[:50]}", option_index=i, emoji=f"{i+1}️⃣")
+            self.add_item(button)
+        
+        # Add results button
+        results_button = discord.ui.Button(
+            label="Show Results",
+            style=discord.ButtonStyle.secondary,
+            emoji="📊"
+        )
+        results_button.callback = self.show_results
+        self.add_item(results_button)
+
+    async def show_results(self, interaction: discord.Interaction):
+        if not self.poll_id:
+            await interaction.response.send_message("Poll ID not found.", ephemeral=True)
+            return
+        
+        try:
+            from bson import ObjectId
+            poll_data = db.polls_collection.find_one({"_id": ObjectId(self.poll_id)})
             
-            for vote_count, i, option in sorted_options:
-                percentage = (vote_count / total_votes) * 100 if total_votes > 0 else 0
-                bar_length = int(percentage / 10)
-                bar = "█" * bar_length + "░" * (10 - bar_length)
+            if not poll_data:
+                await interaction.response.send_message("Poll not found.", ephemeral=True)
+                return
+            
+            # Calculate results
+            embed = discord.Embed(
+                title=f"📊 {poll_data['question']} - Results",
+                color=discord.Color.green()
+            )
+            
+            total_votes = sum(len(voters) for voters in poll_data['votes'].values())
+            
+            for i, option in enumerate(poll_data['options']):
+                vote_count = len(poll_data['votes'].get(str(i), []))
+                percentage = (vote_count / total_votes * 100) if total_votes > 0 else 0
                 
-                winner_emoji = "🏆 " if vote_count == sorted_options[0][0] and vote_count > 0 else ""
-                results_text += f"{winner_emoji}{number_emojis[i]} **{option}**\n"
-                results_text += f"**{vote_count}** votes ({percentage:.1f}%)\n"
-                results_text += f"`{bar}`\n\n"
-        else:
-            results_text = "No votes were cast."
+                bar = "█" * int(percentage // 5) + "░" * (20 - int(percentage // 5))
+                
+                embed.add_field(
+                    name=f"{i+1}️⃣ {option}",
+                    value=f"{bar} {vote_count} votes ({percentage:.1f}%)",
+                    inline=False
+                )
             
-        embed.add_field(name=f"Final Results ({total_votes} total votes):", value=results_text, inline=False)
-        
-        creator = await bot.fetch_user(poll["creator_id"])
-        embed.set_footer(text=f"Poll ended by {interaction.user.display_name}")
-        
-        await message.edit(embed=embed)
-        
-        # Remove poll from database
-        db.polls_collection.delete_one({"message_id": msg_id})
-        
-        await interaction.response.send_message("Poll ended successfully!", ephemeral=True)
-        
-    except Exception as e:
-        await interaction.response.send_message(f"Error ending poll: {e}", ephemeral=True)
+            embed.set_footer(text=f"Total votes: {total_votes}")
+            
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            
+            
+        except Exception as e:
+            await interaction.response.send_message(f"Error showing results: {e}", ephemeral=True)
+
+class PollButton(discord.ui.Button):
+    def __init__(self, label, option_index, emoji):
+        super().__init__(label=label, style=discord.ButtonStyle.primary, emoji=emoji)
+        self.option_index = option_index
     
-    
-    
-    
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            poll_view = self.view
+            if not poll_view.poll_id:
+                await interaction.response.send_message("Poll ID not found.", ephemeral=True)
+                return
+            
+            from bson import ObjectId
+            user_id = interaction.user.id
+            
+            # Get current poll data
+            poll_data = db.polls_collection.find_one({"_id": ObjectId(poll_view.poll_id)})
+            
+            if not poll_data:
+                await interaction.response.send_message("Poll not found.", ephemeral=True)
+                return
+            
+            # Check if user already voted for this option
+            current_votes = poll_data['votes'].get(str(self.option_index), [])
+            
+            if user_id in current_votes:
+                await interaction.response.send_message("You have already voted for this option!", ephemeral=True)
+                return
+            
+            # Remove user's vote from other options (allow vote changing)
+            for option_idx in poll_data['votes']:
+                if user_id in poll_data['votes'][option_idx]:
+                    poll_data['votes'][option_idx].remove(user_id)
+            
+            # Add vote to selected option
+            if str(self.option_index) not in poll_data['votes']:
+                poll_data['votes'][str(self.option_index)] = []
+            poll_data['votes'][str(self.option_index)].append(user_id)
+            
+            # Update database
+            db.polls_collection.update_one(
+                {"_id": ObjectId(poll_view.poll_id)},
+                {"$set": {"votes": poll_data['votes']}}
+            )
+            
+            # Update the embed
+            embed = discord.Embed(
+                title=f"📊 {poll_data['question']}",
+                description="Click the buttons below to vote!",
+                color=discord.Color.blue()
+            )
+            
+            for i, option in enumerate(poll_data['options']):
+                vote_count = len(poll_data['votes'].get(str(i), []))
+                embed.add_field(
+                    name=f"{i+1}️⃣ {option}",
+                    value=f"{vote_count} votes",
+                    inline=False
+                )
+            
+            embed.set_footer(text=f"Poll created by {interaction.guild.get_member(poll_data['creator_id']).display_name if interaction.guild.get_member(poll_data['creator_id']) else 'Unknown'}")
+            
+            await interaction.response.edit_message(embed=embed, view=poll_view)
+            
+        except Exception as e:
+            await interaction.response.send_message(f"Error voting: {e}", ephemeral=True)
 
-
-
-
-
-
-
-
-bot.run(BOT_TOKEN)
-
-# Synchronous wrapper for APScheduler to wait for the async DM send to complete
-def _run_reminder_job(user_id: int, title: str, desc: str):
+@bot.tree.command(name="listpolls", description="lists all active polls", guild=discord.Object(GUILD_ID))
+async def listpolls(interaction: discord.Interaction):
     try:
-        fut = asyncio.run_coroutine_threadsafe(
-            execute_task(user_id, title, desc), bot.loop
-        )
-        # Wait for completion; raises if the coroutine fails
-        fut.result()
+        message = "Here are all the active polls:\n"
+        stored_polls = db.get_all_polls()
+        
+        poll_count = 0
+        for poll in stored_polls:
+            poll_object_id = str(poll["_id"])  # MongoDB ObjectId
+            poll_msg_id = poll.get("poll_msg_id", "N/A")  # Discord message ID
+            poll_title = poll["question"]
+            
+            # Count total votes
+            total_votes = sum(len(voters) for voters in poll.get("votes", {}).values())
+            
+            message += f"\n📊 **{poll_title}**\n"
+            message += f"   Poll Object ID: `{poll_object_id}`\n"
+            message += f"   Message ID: `{poll_msg_id}`\n"
+            message += f"   Total Votes: {total_votes}\n"
+            poll_count += 1
+        
+        if poll_count == 0:
+            message = "No active polls found."
+            
+        await interaction.response.send_message(message, ephemeral=True)
+        
     except Exception as e:
-        # Re-raise so the scheduler marks the job as errored (listener still cleans up)
-        raise e
-    
-    
-    
-    
-    
+        await interaction.response.send_message(f"Error listing polls: {e}", ephemeral=True)
 
 
+@bot.tree.command(name="closepoll", description="close an already created poll", guild=discord.Object(GUILD_ID))
+@app_commands.describe(poll_id="id of poll to close")
+async def closepoll(interaction: discord.Interaction, poll_id: str):
+    try:
+        # Get poll data before deleting
+        poll_data = db.get_poll_by_id(poll_id)
+        if not poll_data:
+            await interaction.response.send_message(f"Poll `{poll_id}` not found.", ephemeral=True)
+            return
+        
+        # Delete from database
+        success = db.rem_poll_doc(poll_id)
+        if not success:
+            await interaction.response.send_message(f"Failed to delete poll `{poll_id}` from database.", ephemeral=True)
+            return
+        
+        # Try to delete the Discord message
+        try:
+            channel = interaction.guild.get_channel(poll_data['channel_id'])
+            if channel:
+                poll_message = await channel.fetch_message(int(poll_data['poll_msg_id']))
+                await poll_message.delete()
+                await interaction.response.send_message(f"Poll '{poll_data['question']}' has been closed and removed.", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"Poll '{poll_data['question']}' removed from database but couldn't find the channel.", ephemeral=True)
+        except discord.NotFound:
+            await interaction.response.send_message(f"Poll '{poll_data['question']}' removed from database but message was already deleted.", ephemeral=True)
+        except Exception as msg_error:
+            await interaction.response.send_message(f"Poll '{poll_data['question']}' removed from database but couldn't delete message: {msg_error}", ephemeral=True)
+            
+    except Exception as e:
+        print("error while closing poll", e)
+        await interaction.response.send_message(f"Error closing poll: {e}", ephemeral=True)
 
+@bot.tree.command(name="set_custom_command", description="set a custom command that replies with a predefined message", guild=discord.Object(GUILD_ID))
+@app_commands.describe(command_name="name of the command", message="message that the command will reply with")
+async def set_custom_command(interaction: discord.Interaction, command_name:str, message:str):
+    existing_names = db.get_existing_command_names()
+    
+    if command_name in existing_names:
+        await interaction.response.send_message(":red_circle: Command with that name already exists", ephemeral=True)
+    else:
+        db.add_command_doc(command_name, message)
+        await interaction.response.send_message(":green_circle: Command added successfully", ephemeral=True)
+   
+   
+@bot.tree.command(name="remove_custom_command", description="remove an existing custom command", guild=discord.Object(GUILD_ID))
+@app_commands.describe(command_name="name of the command")
+async def remove_custom_command(interaction: discord.Interaction, command_name:str):
+    existing_names = db.get_existing_command_names()
+    
+    if command_name in existing_names:
+        db.rem_custom_command(command_name=command_name)
+        await interaction.response.send_message(":green_circle: Command successfully removed", ephemeral=True)
+    else:
+        await interaction.response.send_message(":red_circle: Command doesn't exist", ephemeral=True)
 
+@bot.tree.command(name="list_custom_commands", description="list all existing custom commands", guild=discord.Object(GUILD_ID))
+async def list_custom_commands(interaction: discord.Interaction):
+    try:
+        message = "Here are all the custom commands:\n"
+        customcommands = db.get_all_commands()
+        
+        cmd_count = 0
+        for cmd in customcommands:
+            command = cmd["command_name"]
+            
+            message += f"\n- 💻 **{command}**\n"
+            cmd_count += 1
+        
+        if cmd_count == 0:
+            message = "No custom commands were found."
+            
+        await interaction.response.send_message(message, ephemeral=True)
+        
+    except Exception as e:
+        await interaction.response.send_message(f"Error listing custom commands: {e}", ephemeral=True)
 
+        
+      
+@bot.event
+async def on_message(message: discord.Message):
+    if message.content.startswith("!"):
+        main_command = message.content.removeprefix("!")
+        existing_names = db.get_existing_command_names()
+        
+        if main_command in existing_names:
+            reply = db.get_reply(main_command)
+            await message.channel.send(reply, reference=message)
+            
+async def handle_missed_reminders():
+    try:
+        missed_reminders = db.get_missed_reminders()
+        
+        if not missed_reminders:
+            print("No missed reminders found")
+            return
+            
+        # Get currently active job IDs from scheduler
+        active_job_ids = {job.id for job in bot.scheduler.get_jobs()}
+        
+        executed_count = 0
+        for reminder in missed_reminders:
+            job_id = reminder.get("job_id")
+            user_id = reminder.get("userId")
+            title = reminder.get("title", "Missed Reminder")
+            desc = reminder.get("desc", "")
+            
+            # skip if job is still active
+            if job_id in active_job_ids:
+                continue
+                
+            # execute the missed reminder
+            try:
+                await execute_task(user_id, f"⏰ MISSED: {title}", f"{desc}\n\n**This reminder was scheduled while the bot was offline.**")
+                # Remove from database after sending
+                db.remove_rem_doc(job_id)
+                executed_count += 1
+                
+                # Add small delay to avoid rate limiting
+                await asyncio.sleep(2)
+                
+            except Exception as e:
+                print(f"Failed to send missed reminder {job_id}: {e}")
+        
+        print(f"Executed {executed_count} missed reminders")
+        
+    except Exception as e:
+        print(f"Error handling missed reminders: {e}")
+    
 
 
 
