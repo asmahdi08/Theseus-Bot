@@ -5,7 +5,8 @@ import os
 from discord import app_commands
 from discord.ext import commands
 import utils.utils as utils
-from db import db
+import db
+from db.dbmanager import client as dbclient
 from utils import timezones
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.mongodb import MongoDBJobStore
@@ -43,9 +44,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Suppress PyNaCl warning since we don't use voice features
-logging.getLogger('discord.client').setLevel(logging.ERROR)
-
 # Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
@@ -78,7 +76,7 @@ async def _initialize_scheduler():
         bot.scheduler = BackgroundScheduler(
             jobstores={
                 'default': MongoDBJobStore(
-                    client=db.client, 
+                    client=dbclient, 
                     database='theseusdb', 
                     collection='apscheduler_jobs'
                 )
@@ -98,7 +96,7 @@ async def _initialize_scheduler():
                 if hasattr(event, 'exception') and event.exception:
                     logger.warning(f"Job {event.job_id} failed, keeping database record")
                 else:
-                    db.remove_rem_doc(event.job_id)
+                    db.reminder_ops.remove_rem_doc(event.job_id)
                     logger.debug(f"Cleaned up completed job {event.job_id}")
             except Exception as e:
                 logger.error(f"Failed to cleanup job {event.job_id}: {e}")
@@ -116,7 +114,7 @@ async def _initialize_scheduler():
 async def _process_missed_reminders():
     """Process reminders that were missed while bot was offline"""
     try:
-        missed_reminders = db.get_missed_reminders()
+        missed_reminders = db.reminder_ops.get_missed_reminders()
         
         if not missed_reminders:
             logger.debug("No missed reminders found")
@@ -140,7 +138,7 @@ async def _process_missed_reminders():
                 missed_desc = f"{desc}\n\n*This reminder was delayed due to system downtime*"
                 
                 await execute_task(user_id, missed_title, missed_desc)
-                db.remove_rem_doc(job_id)
+                db.reminder_ops.remove_rem_doc(job_id)
                 processed += 1
                 
                 # Rate limiting to avoid overwhelming Discord API
@@ -168,7 +166,7 @@ async def settimezone(interaction: discord.Interaction):
     async def buttonCallback(callbackinteraction: discord.Interaction):
         chosen = callbackinteraction.data['values'][0]
         await callbackinteraction.response.send_message("Timezone added!")
-        db.create_tz_doc(interaction.user.id,chosen)
+        db.user_ops.create_tz_doc(interaction.user.id,chosen)
         
     dropdownMenu.callback = buttonCallback
     
@@ -185,7 +183,7 @@ async def settimezone(interaction: discord.Interaction):
     time="Time of the day to remind (24-hour format HH:MM)"
 )
 async def setreminder(interaction: discord.Interaction, title: str, description: str, date: str, time: str):
-    user_timezone = db.get_user_tz(userId=interaction.user.id)
+    user_timezone = db.user_ops.get_user_tz(userId=interaction.user.id)
     
     if user_timezone == "-1":
         await interaction.response.send_message("You haven't set your timezone yet. Run `/settimezone` first.", ephemeral=True)
@@ -222,7 +220,7 @@ async def setreminder(interaction: discord.Interaction, title: str, description:
     job_id = reminder_job.id
 
     # Store reminder in DB with job_id
-    db.create_rem_doc(interaction.user.id, title, description, date, time, job_id)
+    db.reminder_ops.create_rem_doc(interaction.user.id, title, description, date, time, job_id)
 
     await interaction.response.send_message(f"Reminder scheduled for {scheduled_time.strftime('%Y-%m-%d %H:%M %Z')} (Job ID: {job_id})", ephemeral=True)
     logger.info(f"Reminder scheduled for user {interaction.user.id}, job ID: {job_id}")
@@ -232,8 +230,8 @@ async def setreminder(interaction: discord.Interaction, title: str, description:
 async def listreminders(interaction: discord.Interaction):
     try:
         # Fetch user's reminders
-        docs = list(db.reminder_collection.find({"userId": interaction.user.id}))
-        tz_name = db.get_user_tz(userId=interaction.user.id)
+        docs = list(db.dbmanager.reminder_collection.find({"userId": interaction.user.id}))
+        tz_name = db.user_ops.get_user_tz(userId=interaction.user.id)
         tz = pytz.timezone(tz_name) if tz_name != "-1" else pytz.utc
 
         if not docs:
@@ -303,7 +301,7 @@ async def cancelreminder(interaction: discord.Interaction, job_id: str):
         return
     try:
         bot.scheduler.remove_job(job_id)
-        db.remove_rem_doc(job_id)
+        db.reminder_ops.remove_rem_doc(job_id)
         await interaction.response.send_message(f"Cancelled reminder with Job ID `{job_id}`.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"Failed to cancel: {e}", ephemeral=True)
@@ -364,7 +362,7 @@ async def createpoll(interaction: discord.Interaction, question: str, options: s
             "created_at": datetime.now().isoformat()
         }
         
-        result = db.polls_collection.insert_one(poll_data)
+        result = db.dbmanager.polls_collection.insert_one(poll_data)
         view.poll_id = str(result.inserted_id)
         
     except Exception as e:
@@ -399,7 +397,7 @@ class PollView(discord.ui.View):
         
         try:
             from bson import ObjectId
-            poll_data = db.polls_collection.find_one({"_id": ObjectId(self.poll_id)})
+            poll_data = db.dbmanager.polls_collection.find_one({"_id": ObjectId(self.poll_id)})
             
             if not poll_data:
                 await interaction.response.send_message("Poll not found.", ephemeral=True)
@@ -449,7 +447,7 @@ class PollButton(discord.ui.Button):
             user_id = interaction.user.id
             
             # Get current poll data
-            poll_data = db.polls_collection.find_one({"_id": ObjectId(poll_view.poll_id)})
+            poll_data = db.dbmanager.polls_collection.find_one({"_id": ObjectId(poll_view.poll_id)})
             
             if not poll_data:
                 await interaction.response.send_message("Poll not found.", ephemeral=True)
@@ -473,7 +471,7 @@ class PollButton(discord.ui.Button):
             poll_data['votes'][str(self.option_index)].append(user_id)
             
             # Update database
-            db.polls_collection.update_one(
+            db.dbmanager.polls_collection.update_one(
                 {"_id": ObjectId(poll_view.poll_id)},
                 {"$set": {"votes": poll_data['votes']}}
             )
@@ -504,7 +502,7 @@ class PollButton(discord.ui.Button):
 async def listpolls(interaction: discord.Interaction):
     try:
         message = "Here are all the active polls:\n"
-        stored_polls = db.get_all_polls()
+        stored_polls = db.polls_ops.get_all_polls()
         
         poll_count = 0
         for poll in stored_polls:
@@ -535,13 +533,13 @@ async def listpolls(interaction: discord.Interaction):
 async def closepoll(interaction: discord.Interaction, poll_id: str):
     try:
         # Get poll data before deleting
-        poll_data = db.get_poll_by_id(poll_id)
+        poll_data = db.polls_ops.get_poll_by_id(poll_id)
         if not poll_data:
             await interaction.response.send_message(f"Poll `{poll_id}` not found.", ephemeral=True)
             return
         
         # Delete from database
-        success = db.rem_poll_doc(poll_id)
+        success = db.polls_ops.rem_poll_doc(poll_id)
         if not success:
             await interaction.response.send_message(f"Failed to delete poll `{poll_id}` from database.", ephemeral=True)
             return
@@ -567,22 +565,22 @@ async def closepoll(interaction: discord.Interaction, poll_id: str):
 @bot.tree.command(name="set_custom_command", description="set a custom command that replies with a predefined message", guild=discord.Object(GUILD_ID))
 @app_commands.describe(command_name="name of the command", message="message that the command will reply with")
 async def set_custom_command(interaction: discord.Interaction, command_name:str, message:str):
-    existing_names = db.get_existing_command_names()
+    existing_names = db.custom_commands_ops.get_existing_command_names()
     
     if command_name in existing_names:
         await interaction.response.send_message(":red_circle: Command with that name already exists", ephemeral=True)
     else:
-        db.add_command_doc(command_name, message)
+        db.custom_commands_ops.add_command_doc(command_name, message)
         await interaction.response.send_message(":green_circle: Command added successfully", ephemeral=True)
    
    
 @bot.tree.command(name="remove_custom_command", description="remove an existing custom command", guild=discord.Object(GUILD_ID))
 @app_commands.describe(command_name="name of the command")
 async def remove_custom_command(interaction: discord.Interaction, command_name:str):
-    existing_names = db.get_existing_command_names()
+    existing_names = db.custom_commands_ops.get_existing_command_names()
     
     if command_name in existing_names:
-        db.rem_custom_command(command_name=command_name)
+        db.custom_commands_ops.rem_custom_command(command_name=command_name)
         await interaction.response.send_message(":green_circle: Command successfully removed", ephemeral=True)
     else:
         await interaction.response.send_message(":red_circle: Command doesn't exist", ephemeral=True)
@@ -591,7 +589,7 @@ async def remove_custom_command(interaction: discord.Interaction, command_name:s
 async def list_custom_commands(interaction: discord.Interaction):
     try:
         message = "Here are all the custom commands:\n"
-        customcommands = db.get_all_commands()
+        customcommands = db.custom_commands_ops.get_all_commands()
         
         cmd_count = 0
         for cmd in customcommands:
@@ -614,10 +612,10 @@ async def list_custom_commands(interaction: discord.Interaction):
 async def on_message(message: discord.Message):
     if message.content.startswith("!"):
         main_command = message.content.removeprefix("!")
-        existing_names = db.get_existing_command_names()
+        existing_names = db.custom_commands_ops.get_existing_command_names()
         
         if main_command in existing_names:
-            reply = db.get_reply(main_command)
+            reply = db.custom_commands_ops.get_reply(main_command)
             await message.channel.send(reply, reference=message)
 
 bot.run(BOT_TOKEN)
